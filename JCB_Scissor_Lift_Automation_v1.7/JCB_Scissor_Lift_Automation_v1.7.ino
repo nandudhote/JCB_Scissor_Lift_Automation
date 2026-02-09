@@ -1,0 +1,933 @@
+#include <Adafruit_Fingerprint.h>  // Include Adafruit fingerprint sensor library
+#include <TFT_eSPI.h>
+#include <EEPROM.h>
+#include <Wire.h>    // I2C communication library (RTC + EEPROM)
+#include <RTClib.h>  // Library for DS3231 RTC
+#include "Adafruit_Keypad.h"
+#include "logo.h"
+#include "logoHeader.h"
+
+// define your specific keypad here via PID
+#define KEYPAD_PID3844
+
+#define R1 27
+#define R2 5
+#define R3 18
+#define R4 19
+#define C1 32
+#define C2 33
+#define C3 25
+#define C4 26
+
+#define SDA 21
+#define SCL 22
+
+#define SCREEN_WIDTH 320
+#define SCREEN_HEIGHT 240
+
+#define EEPROM_ADDR 0x57  // I2C address of external EEPROM on RTC module (AT24C32/64)
+
+#define ADMIN_PASSWORD 1234
+unsigned long NEW_ADMIN_PASSWORD = 1234;
+
+// leave this import after the above configuration
+#include "keypad_config.h"
+
+TFT_eSPI tft = TFT_eSPI();
+Adafruit_Keypad customKeypad = Adafruit_Keypad(makeKeymap(keys), rowPins, colPins, ROWS, COLS);  //initialize an instance of class NewKeypad
+RTC_DS3231 rtc;                                                                                  // Create RTC object for DS3231
+
+/* ================= HARDWARE ================= */
+HardwareSerial FingerSerial(2);              // Create HardwareSerial object using UART2 of ESP32
+Adafruit_Fingerprint finger(&FingerSerial);  // Create fingerprint object using UART2
+
+/* ================= GLOBAL ================= */
+uint8_t fingerID;  // Variable to store fingerprint ID (1–127)
+
+// Structure to store one attendance log entry
+struct LogEntry {
+  uint8_t userID;  // Fingerprint ID
+  uint16_t year;   // Year (e.g. 2026)
+  uint8_t month;   // Month (1–12)
+  uint8_t day;     // Day (1–31)
+  uint8_t hour;    // Hour (0–23)
+  uint8_t minute;  // Minute (0–59)
+  uint8_t second;  // Second (0–59)
+};
+
+#define LOG_SIZE sizeof(LogEntry)  // Size of one log entry (calculated automatically)
+#define MAX_LOGS 500               // Maximum number of logs (depends on EEPROM size)
+#define LOG_COUNT_ADDR 4090        // EEPROM address where total log count is stored (near end of EEPROM)
+
+#define TFT_W 240
+#define MSG_Y 110
+#define LINE_H 22
+#define MAX_LINES 3
+
+uint16_t logIndex = 0;  // Variable to track current log index
+
+String keyBuffer = "";
+int enteredNumber = 0;
+
+bool menuActive = false;
+bool modeSelected = false;
+bool waitingForPassword = false;
+bool waitingForID = false;
+
+bool isRegisterMode = false;
+bool isDeleteMode = false;
+
+/* ===== LONG PRESS (#) DETECTION ===== */
+unsigned long hashPressStart = 0;
+bool hashPressed = false;
+bool adminTriggered = false;
+
+bool adminMenuActive = false;
+bool adminModeSelected = false;
+bool waitingForAdminPassword = false;
+bool waitingForAdminID = false;
+
+bool isFingerprintMode = false;
+bool isPasswordMode = false;
+bool waitingForPreviousePasswordForConformation = false;
+bool waitingForNewPassword = false;
+
+#define HASH_HOLD_TIME 5000  // 5 seconds
+
+
+/* ================= CORE 0 TASK ================= */
+/* Fingerprint Sensor Logic */
+void FingerprintSensorTask(void *pvParameters) {
+  FingerSerial.begin(57600, SERIAL_8N1, 16, 17);         // Start UART2 at 57600 baud, RX=16, TX=17
+  finger.begin(57600);                                   // Initialize fingerprint sensor communication
+  Serial.println("\nAS608 Fingerprint System Started");  // Print startup message
+
+  if (!finger.verifyPassword()) {  // Check if sensor responds correctly
+    Serial.println("Fingerprint sensor not detected");
+  } else {
+    Serial.println("Fingerprint sensor detected");  // Print success message
+  }
+
+  logIndex = readLogCount();  // Restore stored log count
+
+  // finger.getTemplateCount();              // Get number of stored fingerprints
+  // Serial.print("Stored fingerprints: ");  // Print label
+  // Serial.println(finger.templateCount);   // Print number of stored fingerprints
+
+  // Serial.println("\nCommands:");             // Print available commands
+  // Serial.println("e = Enroll");              // Enroll a new fingerprint
+  // Serial.println("s = Search");              // Search a fingerprint
+  // Serial.println("d = Delete ID");           // Delete a fingerprint by ID
+  // Serial.println("c = Count");               // Count stored fingerprints
+  // Serial.println("x = Delete ALL");          // Delete all fingerprints
+  // Serial.println("l = List of All Stored");  // List all stored fingerprint IDs
+  // Serial.println("p = Print Logs");
+
+  while (1) {
+    // controlThroughSerial();
+    vTaskDelay(pdMS_TO_TICKS(100));
+  }
+}
+
+/* KeyPad Logic */
+void KeypadTask(void *pvParameters) {
+  customKeypad.begin();
+
+  while (1) {
+    customKeypad.tick();
+
+    checkKeypad();
+
+    vTaskDelay(pdMS_TO_TICKS(100));
+  }
+}
+
+/* ================= CORE 1 TASK ================= */
+/* Display / UI Logic */
+void displayTask(void *pvParameters) {
+
+  while (1) {
+    if (!menuActive && !modeSelected && !waitingForPassword && !waitingForID && !isRegisterMode && !isDeleteMode && !adminMenuActive && !waitingForNewPassword) {
+      dateAndTimeDisplayOnScreen();
+    }
+    vTaskDelay(pdMS_TO_TICKS(1000));
+  }
+}
+
+/* ================= SETUP ================= */
+void setup() {
+  Serial.begin(9600);    // Start USB serial communication at 9600 baud
+  Wire.begin(SDA, SCL);  // Initialize I2C (SDA=21, SCL=22)
+
+  // Initialize RTC
+  if (!rtc.begin()) {
+    Serial.println("RTC not found");
+  }
+
+  displayInit();
+  logoScreen();
+  delay(5000);
+  logoInHeaderScreen();
+
+
+  /* -------- CORE 0 : Fingerprint Sensor -------- */
+  xTaskCreatePinnedToCore(
+    FingerprintSensorTask,
+    "Fingerprint Sensor Task",
+    4096,
+    // 2048,
+    NULL,
+    3,
+    NULL,
+    0  // 🔴 CORE 0
+  );
+
+  /* -------- CORE 0 : Keypad -------- */
+  xTaskCreatePinnedToCore(
+    KeypadTask,
+    "Keypad Task",
+    // 4096,
+    2048,
+    NULL,
+    3,
+    NULL,
+    0  // 🔴 CORE 0
+  );
+
+  /* -------- CORE 1 : DISPLAY -------- */
+  xTaskCreatePinnedToCore(
+    displayTask,
+    "Display Task",
+    2048,
+    NULL,
+    1,
+    NULL,
+    1  // 🔵 CORE 1
+  );
+}
+
+/* ================= LOOP ================= */
+void loop() {
+}
+
+void displayInit() {
+  tft.init();
+  tft.setRotation(1);
+  tft.fillScreen(TFT_WHITE);
+}
+
+// ================= LOGO SCREEN =================
+void logoScreen() {
+  tft.fillScreen(TFT_WHITE);
+  int x = (SCREEN_WIDTH - LOGO_WIDTH) / 2;
+  int y = (SCREEN_HEIGHT - LOGO_HEIGHT) / 2;
+  tft.setSwapBytes(true);  // CRITICAL for RGB565
+  tft.pushImage(x, y, SCREEN_WIDTH, SCREEN_HEIGHT, Logo);
+}
+
+// ================= LOGO SCREEN =================
+void logoInHeaderScreen() {
+  tft.fillScreen(TFT_WHITE);
+  int x = (SCREEN_WIDTH - LOGO_WIDTH) / 2;
+  int y = (SCREEN_HEIGHT - LOGO_HEIGHT) / 2;
+  tft.setSwapBytes(true);  // CRITICAL for RGB565
+  tft.pushImage(x, y, SCREEN_WIDTH, SCREEN_HEIGHT, LogoHeader);
+}
+
+void dateAndTimeDisplayOnScreen() {
+  // tft.fillRect(0, 50, 320, 190, TFT_WHITE);  // Clear display area
+  DateTime now = rtc.now();
+  tft.setTextSize(2);
+  tft.setTextColor(TFT_BLACK, TFT_WHITE);
+  char timeBuff[9];   // HH:MM:SS
+  char dateBuff[11];  // DD/MM/YYYY
+  // Format with leading zeros
+  sprintf(timeBuff, "%02d:%02d:%02d", now.hour(), now.minute(), now.second());
+  sprintf(dateBuff, "%02d/%02d/%04d", now.day(), now.month(), now.year());
+  // Calculate text width
+  int timeWidth = tft.textWidth(timeBuff);
+  int dateWidth = tft.textWidth(dateBuff);
+  // Screen center
+  int centerX = 320 / 2;
+  int centerY = 240 / 2;
+  // Display centered
+  tft.setCursor(centerX - (timeWidth / 2), centerY - 20);
+  tft.print(timeBuff);
+  tft.setCursor(centerX - (dateWidth / 2), centerY + 10);
+  tft.print(dateBuff);
+}
+
+void registratinAndDeleteOptionDisplayOnScreen() {
+  tft.fillRect(0, 50, 320, 190, TFT_WHITE);  // Clear display area
+  tft.setTextSize(2);
+  tft.setTextColor(TFT_BLACK);  // <-- NO background color
+  String regBuff = "REGISTRATION";
+  String delBuff = "DELETE";
+  // Calculate text widths
+  int regWidth = tft.textWidth(regBuff);
+  int delWidth = tft.textWidth(delBuff);
+  // Screen center
+  int centerX = 320 / 2;
+  int centerY = 240 / 2;
+  int r = 26 / 2;
+  // Center text inside buttons
+  tft.setCursor(centerX - (regWidth / 2), 90);
+  tft.print(regBuff);
+  tft.setCursor(centerX - (delWidth / 2), 140);
+  tft.print(delBuff);
+}
+
+void registratinAndDeleteOptionDisplayOnlyRegisrationOnScreen() {
+  tft.fillRect(0, 50, 320, 190, TFT_WHITE);  // Clear display area
+  tft.setTextSize(2);
+  tft.setTextColor(TFT_BLACK);  // <-- NO background color
+  String regBuff = "REGISTRATION";
+  String delBuff = "DELETE";
+  // Calculate text widths
+  int regWidth = tft.textWidth(regBuff);
+  int delWidth = tft.textWidth(delBuff);
+  // Screen center
+  int centerX = 320 / 2;
+  int centerY = 240 / 2;
+  int r = 26 / 2;
+  // Draw buttons (Light Grey background)
+  tft.fillRoundRect(60, 75, 200, 40, r, TFT_LIGHTGREY);  // REG
+  tft.fillRoundRect(60, 125, 200, 40, r, TFT_WHITE);     // DELETE
+  // Center text inside buttons
+  tft.setCursor(centerX - (regWidth / 2), 90);
+  tft.print(regBuff);
+  tft.setCursor(centerX - (delWidth / 2), 140);
+  tft.print(delBuff);
+}
+
+void registratinAndDeleteOptionDisplayOnlyDeletOnScreen() {
+  // tft.fillRect(0, 50, 320, 190, TFT_WHITE);  // Clear display area
+  tft.setTextSize(2);
+  tft.setTextColor(TFT_BLACK);  // <-- NO background color
+  String regBuff = "REGISTRATION";
+  String delBuff = "DELETE";
+  // Calculate text widths
+  int regWidth = tft.textWidth(regBuff);
+  int delWidth = tft.textWidth(delBuff);
+  // Screen center
+  int centerX = 320 / 2;
+  int centerY = 240 / 2;
+  int r = 26 / 2;
+  // Draw buttons (Light Grey background)
+  tft.fillRoundRect(60, 75, 200, 40, r, TFT_WHITE);       // REG
+  tft.fillRoundRect(60, 125, 200, 40, r, TFT_LIGHTGREY);  // DELETE
+  // Center text inside buttons
+  tft.setCursor(centerX - (regWidth / 2), 90);
+  tft.print(regBuff);
+  tft.setCursor(centerX - (delWidth / 2), 140);
+  tft.print(delBuff);
+}
+
+void displayMassegesOnScreen(String msg) {
+  tft.fillRect(0, 50, 320, 190, TFT_WHITE);  // Clear display area
+  tft.setTextSize(2);
+  tft.setTextColor(TFT_BLACK);  // <-- NO background color
+  int regWidth = tft.textWidth(msg);
+  // Screen center
+  int centerX = 320 / 2;
+  int centerY = 240 / 2;
+  int r = 26 / 2;
+  // Center text inside buttons
+  // tft.setCursor(centerX - (regWidth / 2), 90);
+  tft.setCursor(5, 90);
+  tft.print(msg);
+}
+
+
+void adminMenuDisplayOnScreen() {
+  tft.fillRect(0, 50, 320, 190, TFT_WHITE);  // Clear display area
+  tft.setTextSize(2);
+  tft.setTextColor(TFT_BLACK);  // <-- NO background color
+  String regBuff = "FINGERPRINT";
+  String delBuff = "PASSWORD";
+  // Calculate text widths
+  int regWidth = tft.textWidth(regBuff);
+  int delWidth = tft.textWidth(delBuff);
+  // Screen center
+  int centerX = 320 / 2;
+  int centerY = 240 / 2;
+  int r = 26 / 2;
+  // Center text inside buttons
+  tft.setCursor(centerX - (regWidth / 2), 90);
+  tft.print(regBuff);
+  tft.setCursor(centerX - (delWidth / 2), 140);
+  tft.print(delBuff);
+}
+
+void fingerprintAndpasswordOptionDisplayAndFingerprintModeSelectOnScreen() {
+  tft.fillRect(0, 50, 320, 190, TFT_WHITE);  // Clear display area
+  tft.setTextSize(2);
+  tft.setTextColor(TFT_BLACK);  // <-- NO background color
+  String regBuff = "FINGERPRINT";
+  String delBuff = "PASSWORD";
+  // Calculate text widths
+  int regWidth = tft.textWidth(regBuff);
+  int delWidth = tft.textWidth(delBuff);
+  // Screen center
+  int centerX = 320 / 2;
+  int centerY = 240 / 2;
+  int r = 26 / 2;
+  // Draw buttons (Light Grey background)
+  tft.fillRoundRect(60, 75, 200, 40, r, TFT_LIGHTGREY);  // Fingerprint
+  tft.fillRoundRect(60, 125, 200, 40, r, TFT_WHITE);     // password
+  // Center text inside buttons
+  tft.setCursor(centerX - (regWidth / 2), 90);
+  tft.print(regBuff);
+  tft.setCursor(centerX - (delWidth / 2), 140);
+  tft.print(delBuff);
+}
+
+void fingerprintAndpasswordOptionDisplayAndPasswordModeSelectOnScreen() {
+  tft.fillRect(0, 50, 320, 190, TFT_WHITE);  // Clear display area
+  tft.setTextSize(2);
+  tft.setTextColor(TFT_BLACK);  // <-- NO background color
+  String regBuff = "FINGERPRINT";
+  String delBuff = "PASSWORD";
+  // Calculate text widths
+  int regWidth = tft.textWidth(regBuff);
+  int delWidth = tft.textWidth(delBuff);
+  // Screen center
+  int centerX = 320 / 2;
+  int centerY = 240 / 2;
+  int r = 26 / 2;
+  // Draw buttons (Light Grey background)
+  tft.fillRoundRect(60, 75, 200, 40, r, TFT_WHITE);       // Fingerprint
+  tft.fillRoundRect(60, 125, 200, 40, r, TFT_LIGHTGREY);  // Password
+  // Center text inside buttons
+  tft.setCursor(centerX - (regWidth / 2), 90);
+  tft.print(regBuff);
+  tft.setCursor(centerX - (delWidth / 2), 140);
+  tft.print(delBuff);
+}
+
+void checkKeypad() {
+
+  while (customKeypad.available()) {
+
+    keypadEvent e = customKeypad.read();
+    char key = (char)e.bit.KEY;
+
+    if (e.bit.EVENT != KEY_JUST_PRESSED) return;
+
+    // Serial.print(key);
+    // Serial.println(" pressed");
+
+    /* ===== LONG PRESS DETECTION FOR # ===== */
+    if (key == '#') {
+
+      if (e.bit.EVENT == KEY_JUST_PRESSED) {
+        hashPressed = true;
+        hashPressStart = millis();
+        adminTriggered = false;
+        return;
+      }
+
+      if (e.bit.EVENT == KEY_JUST_RELEASED) {
+        hashPressed = false;
+        hashPressStart = 0;
+        adminTriggered = false;
+        return;
+      }
+    }
+
+    /* ========== DIGITS ========== */
+    if (key >= '0' && key <= '9') {
+      keyBuffer += key;
+      Serial.print("Buffer: ");
+      Serial.println(keyBuffer);
+      return;
+    }
+
+    /* ========== CLEAR ========== */
+    if (key == '*') {
+      keyBuffer = "";
+      Serial.println("Cleared");
+      return;
+    }
+
+    /* ========== OPEN MENU ========== */
+    if (key == 'A') {
+      menuActive = true;
+      Serial.println("Menu Opened");
+      registratinAndDeleteOptionDisplayOnScreen();
+      return;
+    }
+
+    /* ========== SELECT REGISTER ========== */
+    if (key == 'B' && menuActive) {
+      isRegisterMode = true;
+      isDeleteMode = false;
+      Serial.println("Register Selected");
+      registratinAndDeleteOptionDisplayOnlyRegisrationOnScreen();
+      return;
+    }
+
+    /* ========== SELECT DELETE ========== */
+    if (key == 'C' && menuActive) {
+      isDeleteMode = true;
+      isRegisterMode = false;
+      Serial.println("Delete Selected");
+      registratinAndDeleteOptionDisplayOnlyDeletOnScreen();
+      return;
+    }
+
+    /* ========== SELECT Mode Of Admin Fingerprint ========== */
+    if (key == 'B' && adminMenuActive) {
+      isFingerprintMode = true;
+      isPasswordMode = false;
+      Serial.println("Fingerprint Selected");
+      fingerprintAndpasswordOptionDisplayAndFingerprintModeSelectOnScreen();
+      return;
+    }
+
+    /* ========== SELECT Mode Of Admin password ========== */
+    if (key == 'C' && adminMenuActive) {
+      isPasswordMode = true;
+      isFingerprintMode = false;
+      Serial.println("password Selected");
+      fingerprintAndpasswordOptionDisplayAndPasswordModeSelectOnScreen();
+      return;
+    }
+
+    /* ========== SET (D KEY) ========== */
+    if (key == 'D') {
+
+      /* ---- STEP 1: CONFIRM MODE ---- */
+      if (menuActive && !modeSelected) {
+
+        if (!isRegisterMode && !isDeleteMode) {
+          Serial.println("Select Register or Delete first");
+          return;
+        }
+
+        modeSelected = true;
+        waitingForPassword = true;
+        keyBuffer = "";
+
+        Serial.println("Mode Confirmed");
+        Serial.println("Enter Password then press ENTER Key");
+        displayMassegesOnScreen("Enter Password then press ENTER Key");
+        return;
+      }
+
+      /* ---- STEP 1: CONFIRM MODE For Admin Page---- */
+      if (adminMenuActive && !adminModeSelected) {
+
+        if (!isFingerprintMode && !isPasswordMode) {
+          Serial.println("Select Fingerprint or Password Mode first");
+          return;
+        }
+
+        adminModeSelected = true;
+        // waitingForPassword = true;
+        waitingForPreviousePasswordForConformation = true;
+        keyBuffer = "";
+
+        Serial.println("Mode Confirmed");
+        Serial.println("Enter Previouse Admin Password then press ENTER Key");
+        displayMassegesOnScreen("Enter Previouse Admin Password then press ENTER Key");
+        return;
+      }
+
+      if (waitingForPreviousePasswordForConformation) {
+        enteredNumber = keyBuffer.toInt();
+        keyBuffer = "";
+
+        if (enteredNumber == ADMIN_PASSWORD) {
+          Serial.println("Password OK");
+          displayMassegesOnScreen("Password OK");
+          waitingForPreviousePasswordForConformation = false;
+          waitingForNewPassword = true;
+          Serial.println("Enter New Password then press ENTER Key");
+          displayMassegesOnScreen("Enter New Password then press ENTER Key");
+        } else {
+          Serial.println("Wrong Password!");
+          displayMassegesOnScreen("Wrong Password!");
+          resetAllStates();
+        }
+        return;
+      }
+
+      if (waitingForNewPassword) {
+        NEW_ADMIN_PASSWORD = keyBuffer.toInt();
+        keyBuffer = "";
+
+        Serial.println("New Admin Password Updated");
+        displayMassegesOnScreen("New Admin Password Updated!");
+        tft.fillRect(0, 50, 320, 190, TFT_WHITE);  // Clear display area
+        resetAllStates();
+        return;
+      }
+
+      /* ---- STEP 2: PASSWORD ---- */
+      if (waitingForPassword) {
+
+        enteredNumber = keyBuffer.toInt();
+        keyBuffer = "";
+
+        if (enteredNumber == ADMIN_PASSWORD) {
+          Serial.println("Password OK");
+          displayMassegesOnScreen("Password OK");
+          waitingForPassword = false;
+          waitingForID = true;
+          Serial.println("Enter ID then press ENTER Key");
+          displayMassegesOnScreen("Enter ID then press ENTER Key");
+        } else {
+          Serial.println("Wrong Password!");
+          displayMassegesOnScreen("Wrong Password!");
+          resetAllStates();
+        }
+        return;
+      }
+
+      /* ---- STEP 3: ID ---- */
+      if (waitingForID) {
+
+        enteredNumber = keyBuffer.toInt();
+        keyBuffer = "";
+
+        if (enteredNumber < 1 || enteredNumber > 127) {
+          Serial.println("Invalid ID (1-127)");
+          return;
+        }
+
+        fingerID = enteredNumber;
+
+        if (isRegisterMode) {
+          Serial.print("Enrolling ID: ");
+          Serial.println(fingerID);
+          // displayMassegesOnScreen("Enrolling ID: " + String(fingerID));
+          enrollFinger(fingerID);
+        } else if (isDeleteMode) {
+          Serial.print("Deleting ID: ");
+          Serial.println(fingerID);
+          // displayMassegesOnScreen("Deleting ID: " + String(fingerID));
+          deleteFinger(fingerID);
+        }
+        delay(2000);                               // For refresh the page
+        tft.fillRect(0, 50, 320, 190, TFT_WHITE);  // Clear display area
+        resetAllStates();
+        return;
+      }
+    }
+  }
+
+  /* ===== CHECK # HOLD TIME ===== */
+  if (hashPressed && !adminTriggered) {
+    if (millis() - hashPressStart >= HASH_HOLD_TIME) {
+      adminTriggered = true;
+      hashPressed = false;
+
+      /* ENTER ADMIN MODE */
+      adminMenuActive = true;
+
+      Serial.println(">>> ADMIN MODE ACTIVATED <<<");
+      adminMenuDisplayOnScreen();
+    }
+  }
+}
+
+void resetAllStates() {
+  keyBuffer = "";
+  enteredNumber = 0;
+
+  menuActive = false;
+  modeSelected = false;
+  waitingForPassword = false;
+  waitingForID = false;
+
+  isRegisterMode = false;
+  isDeleteMode = false;
+
+  adminMenuActive = false;
+  adminModeSelected = false;
+  waitingForAdminPassword = false;
+  waitingForAdminID = false;
+
+  isFingerprintMode = false;
+  isPasswordMode = false;
+  waitingForPreviousePasswordForConformation = false;
+  waitingForNewPassword = false;
+}
+
+
+
+void controlThroughSerial() {
+  if (Serial.available()) {    // Check if any serial input is available
+    char cmd = Serial.read();  // Read the command character
+
+    if (cmd == 'e') {  // If command is enroll
+      bool result = searchFinger();
+      if (result) {
+        Serial.println("Fingerprint Already Enroll");
+      } else {
+        Serial.println("Enter ID (1-127):");   // Ask user for fingerprint ID
+        fingerID = readID();                   // Read ID from serial
+        if (fingerID < 1 || fingerID > 127) {  // Validate ID range
+          Serial.println("Invalid ID! Try again.");
+          return;  // Exit loop iteration
+        }
+        Serial.println("Enrolling ID: " + String(fingerID));
+        // Print enrolling ID
+        enrollFinger(fingerID);  // Call enroll function
+      }
+    }
+    if (cmd == 'd') {  // If command is delete
+      Serial.println("Enter ID to delete:");
+      fingerID = readID();                   // Read ID from serial
+      if (fingerID < 1 || fingerID > 127) {  // Validate ID range
+        Serial.println("Invalid ID! Try again.");
+        return;
+      }
+      Serial.println("Deleting ID: " + String(fingerID));
+      // Print deleting ID
+      deleteFinger(fingerID);  // Call delete function
+    }
+    if (cmd == 's') searchFinger();     // If command is search, call search function
+    if (cmd == 'c') countFinger();      // Count fingerprints
+    if (cmd == 'x') deleteAllFinger();  // Delete all fingerprints
+    if (cmd == 'l') listStoredIDs();    // List all stored fingerprint IDs
+    if (cmd == 'p') printLogs();        // Print stored logs
+  }
+}
+
+/* ================= READ ID ================= */
+uint8_t readID() {
+  String input = "";  // String to hold user input
+  // Clear any leftover data (like '\n' from command)
+  while (Serial.available()) {
+    Serial.read();  // Flush serial buffer
+  }
+
+  // Wait until a NON-empty number is entered
+  while (true) {
+    while (!Serial.available()) {  // Wait for serial input
+      delay(10);
+    }
+    input = Serial.readStringUntil('\n');  // Read input until newline
+    input.trim();                          // Remove spaces and newline
+    if (input.length() > 0) {              // If valid input received
+      break;
+    }
+  }
+  return input.toInt();  // Convert input to integer and return
+}
+
+/* ================= FUNCTIONS ================= */
+
+void listStoredIDs() {
+  Serial.println("Stored Fingerprint IDs:");  // Print header
+  bool foundAny = false;                      // Flag to track stored IDs
+
+  for (uint8_t id = 1; id <= 127; id++) {  // Loop through all possible IDs
+    uint8_t p = finger.loadModel(id);      // Try loading fingerprint model
+    if (p == FINGERPRINT_OK) {             // If model exists
+      Serial.print("ID ");
+      Serial.print(id);
+      Serial.println(" exists");
+      foundAny = true;  // Mark that at least one ID exists
+    }
+  }
+
+  if (!foundAny) {
+    Serial.println("No fingerprints stored");  // No IDs found
+  }
+}
+
+void enrollFinger(uint8_t id) {
+  int p = -1;  // Variable for sensor response
+
+  Serial.println("Place finger");  // Ask user to place finger
+  displayMassegesOnScreen("Place Finger");
+  while (p != FINGERPRINT_OK) {
+    p = finger.getImage();  // Capture fingerprint image
+  }
+  finger.image2Tz(1);  // Convert image to template buffer 1
+  // delay(2000);                      // For debug
+  Serial.println("Remove Finger");  // Ask user to remove finger
+  displayMassegesOnScreen("Remove finger");
+  delay(2000);                                // Wait for finger removal
+  Serial.println("Place same Finger again");  // Ask for second scan
+  displayMassegesOnScreen("Place same Finger again");
+  while (finger.getImage() != FINGERPRINT_OK)
+    ;                  // Wait for image
+  finger.image2Tz(2);  // Convert second image to buffer 2
+  // delay(2000);         // For debug
+  if (finger.createModel() != FINGERPRINT_OK) {
+    Serial.println("Finger Mismatch");  // If fingerprints don't match
+    displayMassegesOnScreen("Finger Mismatch");
+    return;
+  }
+  if (finger.storeModel(id) == FINGERPRINT_OK) {
+    Serial.println("Fingerprint stored successfully");
+    displayMassegesOnScreen("Fingerprint stored successfully!");  // Store success
+  } else {
+    Serial.println("Store failed");
+    displayMassegesOnScreen("Store failed");
+  }  // Store failed
+}
+
+bool searchFinger() {
+  int p = -1;                                // Variable for sensor response
+  Serial.println("Place finger to search");  // Ask user to place finger
+  // WAIT until finger is detected
+  while (p != FINGERPRINT_OK) {
+    p = finger.getImage();  // Capture fingerprint image
+    delay(50);
+  }
+  p = finger.image2Tz(1);  // Convert image to template buffer
+  Serial.println("Convert image to template : " + String(p));
+  p = finger.fingerSearch();  // Search fingerprint database
+  Serial.println("Search database : " + String(p));
+  if (p == FINGERPRINT_OK) {
+    Serial.print("Found ID: ");
+    Serial.print(finger.fingerID);  // Print matched ID
+    Serial.print("  Confidence: ");
+    Serial.println(finger.confidence);  // Print confidence score
+    // storeRTCLog(finger.fingerID);       // Store log if matched
+    return true;  // Match found
+  } else {
+    Serial.println("No match found");  // No match
+    return false;
+  }
+}
+
+void deleteFinger(uint8_t id) {
+  if (finger.deleteModel(id) == FINGERPRINT_OK) Serial.println("Fingerprint deleted");  // Delete success
+  else Serial.println("Delete failed");                                                 // Delete failed
+}
+
+void countFinger() {
+  finger.getTemplateCount();  // Get fingerprint count
+  Serial.print("Total fingerprints: ");
+  Serial.println(finger.templateCount);  // Print count
+}
+
+void deleteAllFinger() {
+  if (finger.emptyDatabase() == FINGERPRINT_OK)
+    Serial.println("All fingerprints deleted");  // Database cleared
+  else
+    Serial.println("Database clear failed");  // Clear failed
+}
+
+/* ================= EEPROM LOW LEVEL WRITE ================= */
+
+// Write a single byte to EEPROM
+void eepromWriteByte(uint16_t addr, uint8_t data) {
+  Wire.beginTransmission(EEPROM_ADDR);  // Start I2C communication with EEPROM
+  Wire.write(addr >> 8);                // Send high byte of address
+  Wire.write(addr & 0xFF);              // Send low byte of address
+  Wire.write(data);                     // Send data byte
+  Wire.endTransmission();               // End transmission
+  delay(5);                             // EEPROM write delay (important)
+}
+
+/* ================= EEPROM LOW LEVEL READ ================= */
+
+// Read a single byte from EEPROM
+uint8_t eepromReadByte(uint16_t addr) {
+  Wire.beginTransmission(EEPROM_ADDR);  // Start I2C communication
+  Wire.write(addr >> 8);                // High byte of address
+  Wire.write(addr & 0xFF);              // Low byte of address
+  Wire.endTransmission();               // End transmission
+
+  Wire.requestFrom(EEPROM_ADDR, 1);  // Request 1 byte from EEPROM
+  return Wire.read();                // Return received byte
+}
+
+/* ================= SAVE LOG COUNT ================= */
+
+// Store total number of logs in EEPROM
+void saveLogCount(uint16_t count) {
+  eepromWriteByte(LOG_COUNT_ADDR, count >> 8);        // Store high byte
+  eepromWriteByte(LOG_COUNT_ADDR + 1, count & 0xFF);  // Store low byte
+}
+
+/* ================= READ LOG COUNT ================= */
+
+// Read total log count from EEPROM
+uint16_t readLogCount() {
+  return (eepromReadByte(LOG_COUNT_ADDR) << 8) |  // Read high byte
+         eepromReadByte(LOG_COUNT_ADDR + 1);      // Read low byte
+}
+
+/* ================= WRITE ONE LOG ================= */
+
+// Write one LogEntry structure to EEPROM
+void writeLog(uint16_t index, LogEntry log) {
+  uint16_t addr = index * LOG_SIZE;  // Calculate EEPROM address
+  uint8_t *p = (uint8_t *)&log;      // Convert structure to byte array
+
+  // Write each byte of the structure
+  for (uint8_t i = 0; i < LOG_SIZE; i++) {
+    eepromWriteByte(addr + i, p[i]);
+  }
+}
+
+/* ================= READ ONE LOG ================= */
+
+// Read one LogEntry structure from EEPROM
+LogEntry readLog(uint16_t index) {
+  LogEntry log;                      // Create structure variable
+  uint16_t addr = index * LOG_SIZE;  // Calculate EEPROM address
+  uint8_t *p = (uint8_t *)&log;      // Pointer to structure bytes
+
+  // Read each byte from EEPROM
+  for (uint8_t i = 0; i < LOG_SIZE; i++) {
+    p[i] = eepromReadByte(addr + i);
+  }
+  return log;  // Return filled structure
+}
+
+/* ================= STORE RTC LOG ================= */
+
+// Store fingerprint match log with RTC timestamp
+void storeRTCLog(uint8_t userID) {
+  DateTime now = rtc.now();  // Read current date & time from RTC
+  LogEntry log;              // Create log structure
+
+  log.userID = userID;        // Store fingerprint ID
+  log.year = now.year();      // Store year
+  log.month = now.month();    // Store month
+  log.day = now.day();        // Store day
+  log.hour = now.hour();      // Store hour
+  log.minute = now.minute();  // Store minute
+  log.second = now.second();  // Store second
+
+  writeLog(logIndex, log);  // Write log to EEPROM
+  logIndex++;               // Increment log counter
+  saveLogCount(logIndex);   // Save updated count
+
+  Serial.println("Log stored in RTC EEPROM");
+}
+
+// Print all stored logs via Serial Monitor
+void printLogs() {
+  Serial.println("---- ATTENDANCE LOGS ----");
+
+  for (uint16_t i = 0; i < logIndex; i++) {
+    LogEntry log = readLog(i);  // Read log from EEPROM
+
+    Serial.print("ID ");
+    Serial.print(log.userID);
+    Serial.print("  ");
+
+    Serial.print(log.year);
+    Serial.print("-");
+    Serial.print(log.month);
+    Serial.print("-");
+    Serial.print(log.day);
+    Serial.print(" ");
+
+    Serial.print(log.hour);
+    Serial.print(":");
+    Serial.print(log.minute);
+    Serial.print(":");
+    Serial.println(log.second);
+  }
+}
